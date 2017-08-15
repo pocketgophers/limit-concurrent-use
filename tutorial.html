@@ -1,0 +1,184 @@
+{{removeAll .BuildDir}}
+{{mkdirAll .BuildDir}}
+{{removeAll .SiteDir}}
+{{mkdirAll .SiteDir}}
+
+{{copy "info.toml" .SiteDir "info.toml"}}
+{{copy "build-readme.md" .BuildDir "README.md"}}
+
+<!--
+pain: concurrent workload uses too much (cpu, ram, disk, etc)
+fix: semaphore
+-->
+
+<p>One of the reasons people come to Go is for the performance benefits that come from running a concurrent program in parallel (i.e., on multiple cores). However, concurrency can also cause problems such as:
+	<ul>
+		<li>Unexpected behavior due to race condition by concurrent access.</li>
+		<li>Decreased performance caused by resource contention (e.g., too much disk access at a time).</li>
+		<li>Program is killed when it runs the system out of memory.</li>
+	</ul>
+</p>
+
+<p>While Go schedules CPU access by limiting the number of concurrently running goroutines (with <a href="https://golang.org/pkg/runtime/">GOMAXPROCS</a>), it does not manage any of the resources used by those goroutines such as memory, disk, network, <a href="https://golang.org/pkg/os/exec/"><code>os/exec</code></a>ed processes, etc. Since Go does not manage them, your program needs to.</p>
+
+<p>I'll show you several way to limit concurrent resource use. You can get the code by running:</p>
+
+<pre><code>go get -d pocketgophers.com/limit-concurrent-use</code></pre>
+
+<h2>An example to work from</h2>
+
+<p>One of the problems in understanding how concurrent things work is figuring out what things are happening at the same time. So, we'll start out without concurrency:</p>
+
+{{copy "serial.go" .BuildDir "serial.go"}}
+{{file "serial.go"}}
+
+<p>The resource each task uses is a second of time. Each task uses one second, and prints out which one it used. Since this program is serial, each task uses a different second.</p>
+
+{{run "go run serial.go"}}
+
+<!-- <ul>
+	<li>use log.Ltime, log.Println to visualize when things happen; lines with the same time run concurrently</li>
+	<li>the work is simulated with time.Sleep, this is useful for changing the timing, but doesn't use resources, so focus on how times are grouped instead of overall run time. When you apply what will be shown, then focus on runtime to find a good number of concurrent processes.</li>
+	<li>time is a proxy to show what is running concurrently</li>
+</ul> -->
+
+<h2>Unlimited Concurrency</h2>
+
+<p>That serial implementation is slow because the tasks aren't sharing the resource they need. Surely all the tasks could use the same second. For that, we need a concurrent implementation.</p>
+
+{{copy "unlimited.go" .BuildDir "unlimited.go"}}
+{{file "unlimited.go"}}
+
+<p>Each task is ran in a separate goroutine. This allows up to <code>GOMAXPROCS</code> to execute at the same time. The <code>sync.WaitGroup</code> is used to keep the program running until all the tasks complete. Notice that <code>i</code> is passed into each task so the goroutines don't share the same <code>i</code>. Not doing this is a common error because each loop iteration uses the same <code>i</code>.</p>
+
+<p>If the computer is fast enough, or there are enough cores to run on, all of the tasks could use the same second.</p>
+
+{{run "go run unlimited.go"}}
+
+<p>It ends up my computer is fast enough. Each task printed out the same time.</p>
+
+<p>So maybe this is a bad example of resource contention because all the tasks were able to use the same second. Increasing the number of tasks from 9 to 9000 creates enough contention on my computer that two seconds were needed. If your resource contention is also low, it might not be worth the effort to figure out what the limits are and enforce them.</p>
+
+<p>In this case, the fact that all the tasks can use the same second means that tasks using different seconds is due to the method that limits concurrent access.</p>
+
+<!-- <ul>
+	<li><code>wg.Add</code> in the loop (not the goroutine) to guarantee it runs before wg.Wait. Running  go func()() doesn't actually start the goroutine, it creates it and marks it as runnable</li>
+	<li>defer wg.Done(), using defer allows for early returns in the function</li>
+	<li>make sure each goroutine has its own i by passing it to the function. I prefer this method because it gives me one place to check (the function definition argument list) the values used by the loop are copied into the goroutine instead of closed.</li>
+</ul> -->
+
+<h2>Single Access</h2>
+
+<p>You can limit concurrent resource use to a single accessor with a <a href="https://golang.org/pkg/sync/#Mutex"><code>sync.Mutex</code></a>. A mutex is usually used to avoid <a href="https://en.wikipedia.org/wiki/Race_condition">race conditions</a>.</p>
+
+{{copy "mutex.go" .BuildDir "mutex.go"}}
+{{file "mutex.go"}}
+
+<p>The idea is that each task tries to <code>Lock</code> access to the resource away from other tasks while it performs the task. When the task is complete, it <code>Unlock</code>s access, allowing some other task access to the resource.</p>
+
+{{run "go run mutex.go"}}
+
+<p>Each task, running in its own goroutine, used a different second. This means we successfully limited concurrent resource use to a single user at a time.</p>
+
+<p>A mutex is most useful when only a part of your code needs to access the shared resource. That part is called the critical section.</p>
+
+<h2>Critical Sections and Performance</h2>
+
+<p>The part of code that needs access to the shared resource is known as the <a href="https://en.wikipedia.org/wiki/Critical_section">critical section</a>. Here are two ways to control what part of the code is in the critical section:</p>
+
+<pre><code>go func() {
+	// not critical
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// critical section
+}()
+</code></pre>
+
+<pre><code>go func() {
+	// not critical
+
+	mu.Lock()
+	// critical section
+	mu.Unlock()	
+
+	// not critical
+}()
+</code></pre>
+
+<p>I prefer <code>defer</code> because is keeps the <code>Lock</code>/<code>Unlock</code> together and makes early <code>return</code>s in the critical section easier (because you don't have to make sure to <code>Unlock</code> at each one).</p>
+
+<p>The main performance concern is that when a task is in its critical section, other tasks are waiting to get their turn.</p>
+
+<p>In this example, the mutex version takes as long as the serial version. It is also less efficient because the programmer had to write more code that does more work:
+	<ul>
+		<li>launching goroutines</li>
+		<li>scheduling goroutines</li>
+		<li>tasks contending to lock the mutex</li>
+	</ul>
+</p>
+
+<p>However, if the critical section of the tasks is only a small part, the performance gains can be worth the extra work.</p>
+
+<!-- <p>defer:
+<ul>
+	<li>lock/unlock are together, making it harder to not unlock a locked resource</li>
+	<li>early returns from the function are easy as unlock is managed by defer</li>
+	<li>lock/unlock in LIFO order (guaranteed by defer), this prevents deadlocks</li>
+</ul></p> -->
+
+<h2>Single Writer, Multiple Reader</h2>
+
+<p>Sometimes not all of your tasks will need exclusive access. For example if most of your tasks only read from a variable while only a few need to change it. Performance can be greatly improved by allowing an arbitrary number of readers concurrent access, but giving exclusive access to a writer. This is accomplished with a <a href="https://en.wikipedia.org/wiki/Readers–writer_lock">readers-writer lock</a>, available in Go as <a href="https://golang.org/pkg/sync/#RWMutex"><code>sync.RWMutex</code></a>.</p>
+
+{{copy "rwmutex.go" .BuildDir "rwmutex.go"}}
+{{file "rwmutex.go"}}
+
+<p>I have task 4 act as a writer, while the other tasks act as readers.</p>
+
+{{run "go run rwmutex.go"}}
+
+<p>Notice the second used by task 4 is only used by task 4. The other tasks use the second before or after the one used by task 4.</p>
+
+<h2>Limited Concurrency</h2>
+
+<p>Sometimes concurrent access is fine, but too much concurrent use will hinder performance. For example, multiple network transfers can happen at the same time. However, your bandwidth limits the number of transfers that can perform well at the same time. <a href="https://en.wikipedia.org/wiki/Semaphore_(programming)">Semaphores</a> allow for concurrent access, but limit the number of concurrent accessors. Buffered channels can be used to implement a semaphore.</p>
+
+{{copy "semaphore.go" .BuildDir "semaphore.go"}}
+{{file "semaphore.go"}}
+
+<p>The capacity of the channel, in this case 3, is the maximum number of concurrent accessors. To lock the resource, a task will send a value on the channel. If the channel is full, the send will block until a value is read from the channel, which is how a task releases its lock.</p>
+
+{{run "go run semaphore.go"}}
+
+<p>Notice that 3 tasks use each second.</p>
+
+<!-- <ul>
+	<li>What is a semaphore?</li>
+	<li>https://en.wikipedia.org/wiki/Semaphore_(programming)</li>
+	<li>sending to a buffered channel will block when the channel is full</li>
+	<li>receiving from that same channel will free a space in the channel, unblocking some other goroutine trying to send to it</li>
+	<li>the capacity of the channel (in this case 4) is the number of concurrently executing goroutines allowed</li>
+	<li>The order of send, receive is important (it won't work the other way)</li>
+	<li>defer is used to allow for early return in the function. I generally use defer in these cases because I won't miss a return site. While not using defer can be computationally more performant, my time programming and making sure I did it right is usually worth more.</li>
+</ul> -->
+
+<h2>Limited Goroutines</h2>
+
+<p>So far all the concurrent examples used one goroutine for each task. While goroutines are cheap to run, they aren't free as they use memory and need to be scheduled. You can limit the number of goroutines used to execute your tasks with worker pool.</p>
+
+{{copy "pool.go" .BuildDir "pool.go"}}
+{{file "pool.go"}}
+
+<p>A goroutine is launched for each worker, in this case 3 of them. Each worker waits for a task to come in on the <code>tasks</code> channel. When one arrives, the worker performs the task. Tasks are sent from another goroutine. After all the tasks are sent, the <code>tasks</code> channel is closed. When a channel is closed, any values remaining in the channel will be received. When the channel is both closed and empty, the <code>for</code> … <code>range</code> loops will finish, ending the workers.</p>
+
+<!-- <ul>
+	<li>goroutines are cheap, but not free: memory and scheduling time</li>
+	<li>limit number of goroutines (in that pool)</li>
+	<li>also limits resource use by proxy (by limiting number of goroutines using the resource</li>
+</ul> -->
+
+{{run "go run pool.go"}}
+
+<p>As you can see, each second was used by 3 tasks. However, only 4 goroutines (3 workers + the task sender) were used to execute the tasks whereas the semaphore example used 9 (one for each task).</p>
